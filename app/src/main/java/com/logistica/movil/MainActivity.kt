@@ -5,11 +5,17 @@ package com.logistica.movil
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.provider.Settings
+import android.widget.MediaController
+import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -18,12 +24,19 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -33,18 +46,27 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -94,15 +116,13 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
-
 }
 
 private val catColors = mapOf(
     Cat.FOTOS to Color(0xFFFF6FA5),
     Cat.VIDEOS to Color(0xFF8E54E9),
     Cat.MUSICA to Color(0xFFFFA726),
-    Cat.DOCS to Color(0xFF29B6F6),
-    Cat.OCULTOS to Color(0xFF607D8B)
+    Cat.DOCS to Color(0xFF29B6F6)
 )
 
 private fun colorOf(c: Cat?): Color = c?.let { catColors[it] } ?: Color(0xFF607D8B)
@@ -111,9 +131,30 @@ private fun iconFor(c: Cat?): ImageVector = when (c) {
     Cat.FOTOS -> Icons.Default.Image
     Cat.VIDEOS -> Icons.Default.Videocam
     Cat.MUSICA -> Icons.Default.MusicNote
-    Cat.DOCS -> Icons.Default.Description
-    else -> Icons.Default.VisibilityOff
+    else -> Icons.Default.Description
 }
+
+private fun waColor(g: WaGroup): Color = when (g) {
+    WaGroup.VOZ -> Color(0xFF25D366)
+    WaGroup.FOTOS -> Color(0xFFFF6FA5)
+    WaGroup.VIDEOS -> Color(0xFF8E54E9)
+    WaGroup.DOCS -> Color(0xFF29B6F6)
+    WaGroup.STICKERS -> Color(0xFFFFA726)
+    WaGroup.AUDIOS -> Color(0xFF26A69A)
+    WaGroup.GIFS -> Color(0xFFEF5350)
+}
+
+private fun waIcon(g: WaGroup): ImageVector = when (g) {
+    WaGroup.VOZ -> Icons.Default.Mic
+    WaGroup.FOTOS -> Icons.Default.Image
+    WaGroup.VIDEOS -> Icons.Default.Videocam
+    WaGroup.DOCS -> Icons.Default.Description
+    WaGroup.STICKERS -> Icons.Default.EmojiEmotions
+    WaGroup.AUDIOS -> Icons.Default.MusicNote
+    WaGroup.GIFS -> Icons.Default.Gif
+}
+
+private fun <T> Set<T>.toggle(x: T): Set<T> = if (x in this) this - x else this + x
 
 private sealed class Line {
     data class Header(val text: String) : Line()
@@ -147,7 +188,7 @@ fun PermissionScreen(onGrant: () -> Unit) {
 }
 
 @Composable
-fun Logo(size: androidx.compose.ui.unit.Dp) {
+fun Logo(size: Dp) {
     Surface(shape = RoundedCornerShape(22.dp), color = Color.White, shadowElevation = 4.dp) {
         Image(painterResource(R.drawable.ic_logo), null, Modifier.padding(size * 0.12f).size(size * 0.76f))
     }
@@ -159,7 +200,9 @@ fun MainScreen() {
     val scope = rememberCoroutineScope()
     val snack = remember { SnackbarHostState() }
 
-    var cats by remember { mutableStateOf(setOf(Cat.FOTOS)) }
+    var mode by remember { mutableStateOf(0) } // 0 = por tipo, 1 = WhatsApp
+    var opts by remember { mutableStateOf(setOf(Opt(Cat.FOTOS, false))) }
+    var waSel by remember { mutableStateOf(WaGroup.values().toSet()) }
     var results by remember { mutableStateOf<List<FileItem>>(emptyList()) }
     var groups by remember { mutableStateOf<List<List<FileItem>>>(emptyList()) }
     var dupMode by remember { mutableStateOf(false) }
@@ -167,25 +210,49 @@ fun MainScreen() {
     var busy by remember { mutableStateOf<String?>(null) }
     var job by remember { mutableStateOf<Job?>(null) }
     var sort by remember { mutableStateOf(0) }
+    var grid by remember { mutableStateOf(false) }
     var searched by remember { mutableStateOf(false) }
     var showMove by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var preview by remember { mutableStateOf<FileItem?>(null) }
 
-    val lines: List<Line> = remember(results, groups, dupMode, sort) {
-        if (dupMode) groups.flatMapIndexed { i, g ->
-            listOf<Line>(Line.Header("Grupo ${i + 1} · ${g.size} copias · ${Fx.fmtSize(g.first().size)} cada una")) +
-                g.map { Line.Entry(it) }
-        } else sortItems(results, sort).map { Line.Entry(it) }
+    val lines: List<Line> = remember(results, groups, dupMode, sort, mode) {
+        when {
+            dupMode -> groups.flatMapIndexed { i, g ->
+                listOf<Line>(Line.Header("Grupo ${i + 1} · ${g.size} copias · ${Fx.fmtSize(g.first().size)} cada una")) +
+                    g.map { Line.Entry(it) }
+            }
+            mode == 1 -> {
+                val out = ArrayList<Line>()
+                WaGroup.values().forEach { g ->
+                    val its = results.filter { it.group == g.label }
+                    if (its.isNotEmpty()) {
+                        out.add(Line.Header("${g.label} · ${its.size} archivos · ${Fx.fmtSize(its.sumOf { it.size })}"))
+                        sortItems(its, sort).forEach { out.add(Line.Entry(it)) }
+                    }
+                }
+                out
+            }
+            else -> sortItems(results, sort).map { Line.Entry(it) }
+        }
     }
     val visible = remember(lines) { lines.filterIsInstance<Line.Entry>().map { it.item } }
     val extras = remember(groups) { groups.flatMap { it.drop(1) } }
+
+    fun switchMode(m: Int) {
+        job?.cancel()
+        mode = m; results = emptyList(); groups = emptyList(); dupMode = false
+        selected = emptySet(); busy = null; searched = false
+    }
 
     fun runSearch() {
         job?.cancel()
         selected = emptySet(); dupMode = false; groups = emptyList()
         job = scope.launch {
             busy = "Buscando archivos…"
-            val r = Fx.scan(Environment.getExternalStorageDirectory(), cats) { n -> busy = "Buscando… $n encontrados" }
+            val root = Environment.getExternalStorageDirectory()
+            val r = if (mode == 0) Fx.scan(root, opts) { n -> busy = "Buscando… $n encontrados" }
+            else Fx.scanWhatsApp(root, waSel) { n -> busy = "Buscando… $n encontrados" }
             results = r; searched = true; busy = null
         }
     }
@@ -240,6 +307,7 @@ fun MainScreen() {
     }
 
     val navBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val canSearch = busy == null && (if (mode == 0) opts.isNotEmpty() else waSel.isNotEmpty())
 
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
@@ -251,9 +319,9 @@ fun MainScreen() {
                         Text("${selected.size} seleccionados", fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 8.dp, bottom = 4.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilledTonalButton(
-                                onClick = { visible.firstOrNull { it.path in selected }?.let { Fx.open(ctx, it) } },
+                                onClick = { visible.firstOrNull { it.path in selected }?.let { preview = it } },
                                 enabled = selected.size == 1, modifier = Modifier.weight(1f)
-                            ) { Icon(Icons.Default.OpenInNew, null); Spacer(Modifier.width(4.dp)); Text("Abrir") }
+                            ) { Icon(Icons.Default.Visibility, null); Spacer(Modifier.width(4.dp)); Text("Ver") }
                             FilledTonalButton(onClick = { showMove = true }, modifier = Modifier.weight(1f)) {
                                 Icon(Icons.Default.DriveFileMove, null); Spacer(Modifier.width(4.dp)); Text("Mover")
                             }
@@ -284,33 +352,75 @@ fun MainScreen() {
                 }
             }
 
-            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = navBottom + 16.dp)) {
-                item {
-                    Column(Modifier.padding(12.dp)) {
-                        Text("¿Qué quieres buscar?", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        Spacer(Modifier.height(6.dp))
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(if (grid) 3 else 1),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(start = 8.dp, end = 8.dp, bottom = navBottom + 16.dp)
+            ) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Column(Modifier.padding(horizontal = 4.dp, vertical = 8.dp)) {
+                        TabRow(selectedTabIndex = mode, containerColor = Color.Transparent) {
+                            Tab(selected = mode == 0, onClick = { switchMode(0) }, text = { Text("Por tipo") })
+                            Tab(selected = mode == 1, onClick = { switchMode(1) }, text = { Text("WhatsApp") })
+                        }
+                        Spacer(Modifier.height(10.dp))
+
+                        if (mode == 0) {
+                            Text("¿Qué quieres buscar?", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                             Cat.values().forEach { c ->
                                 val col = colorOf(c)
-                                FilterChip(
-                                    selected = c in cats,
-                                    onClick = { cats = if (c in cats) cats - c else cats + c },
-                                    label = { Text(c.label) },
-                                    leadingIcon = { Icon(iconFor(c), null, tint = col, modifier = Modifier.size(18.dp)) },
-                                    colors = FilterChipDefaults.filterChipColors(selectedContainerColor = col.copy(alpha = .25f))
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
+                                    Box(Modifier.size(32.dp).clip(CircleShape).background(col.copy(alpha = .2f)), contentAlignment = Alignment.Center) {
+                                        Icon(iconFor(c), null, tint = col, modifier = Modifier.size(18.dp))
+                                    }
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(c.label, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                    FilterChip(
+                                        selected = Opt(c, false) in opts,
+                                        onClick = { opts = opts.toggle(Opt(c, false)) },
+                                        label = { Text("Visibles") },
+                                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = col.copy(alpha = .25f))
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    FilterChip(
+                                        selected = Opt(c, true) in opts,
+                                        onClick = { opts = opts.toggle(Opt(c, true)) },
+                                        label = { Text("Ocultas") },
+                                        leadingIcon = { Icon(Icons.Default.VisibilityOff, null, modifier = Modifier.size(16.dp)) },
+                                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = col.copy(alpha = .25f))
+                                    )
+                                }
                             }
+                            Text(
+                                "Ocultas: archivos cuyo nombre o carpeta empieza con punto.",
+                                fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(top = 2.dp)
+                            )
+                        } else {
+                            Text("Carpeta Media de WhatsApp", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Spacer(Modifier.height(6.dp))
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                WaGroup.values().forEach { g ->
+                                    val col = waColor(g)
+                                    FilterChip(
+                                        selected = g in waSel,
+                                        onClick = { waSel = waSel.toggle(g) },
+                                        label = { Text(g.label) },
+                                        leadingIcon = { Icon(waIcon(g), null, tint = col, modifier = Modifier.size(18.dp)) },
+                                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = col.copy(alpha = .25f))
+                                    )
+                                }
+                            }
+                            Text(
+                                "Los enlaces no se guardan como archivos en la carpeta de WhatsApp, por eso no aparecen aquí.",
+                                fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp)
+                            )
                         }
-                        Text(
-                            "Ocultos incluye cualquier archivo oculto (nombre o carpeta que empieza con punto), de cualquier formato.",
-                            fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp)
-                        )
+
                         Spacer(Modifier.height(10.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = { runSearch() }, enabled = cats.isNotEmpty() && busy == null,
-                                modifier = Modifier.weight(1f)
-                            ) { Icon(Icons.Default.Search, null); Spacer(Modifier.width(6.dp)); Text("Buscar") }
+                            Button(onClick = { runSearch() }, enabled = canSearch, modifier = Modifier.weight(1f)) {
+                                Icon(Icons.Default.Search, null); Spacer(Modifier.width(6.dp)); Text("Buscar")
+                            }
                             OutlinedButton(
                                 onClick = { runDuplicates() }, enabled = results.isNotEmpty() && busy == null,
                                 modifier = Modifier.weight(1f)
@@ -357,6 +467,11 @@ fun MainScreen() {
                                     Icon(Icons.Default.Close, null); Spacer(Modifier.width(4.dp)); Text("Ninguno")
                                 }
                             }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Vista:", fontSize = 13.sp)
+                                FilterChip(selected = !grid, onClick = { grid = false }, label = { Text("Lista") })
+                                FilterChip(selected = grid, onClick = { grid = true }, label = { Text("Miniaturas") })
+                            }
                             if (!dupMode) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Text("Ordenar:", fontSize = 13.sp)
@@ -374,21 +489,22 @@ fun MainScreen() {
                     }
                 }
 
-                items(lines, key = { l -> when (l) { is Line.Header -> "h" + l.text; is Line.Entry -> l.item.path } }) { line ->
+                items(
+                    lines,
+                    key = { l -> when (l) { is Line.Header -> "h" + l.text; is Line.Entry -> l.item.path } },
+                    span = { l -> if (grid && l is Line.Entry) GridItemSpan(1) else GridItemSpan(maxLineSpan) }
+                ) { line ->
                     when (line) {
                         is Line.Header -> Text(
                             line.text, fontWeight = FontWeight.Bold, color = Color(0xFF5B5BD6),
-                            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 2.dp)
+                            modifier = Modifier.padding(start = 4.dp, top = 12.dp, bottom = 2.dp)
                         )
-                        is Line.Entry -> FileRow(
-                            item = line.item,
-                            selected = line.item.path in selected,
-                            onToggle = {
-                                val p = line.item.path
-                                selected = if (p in selected) selected - p else selected + p
-                            },
-                            onOpen = { Fx.open(ctx, line.item) }
-                        )
+                        is Line.Entry -> {
+                            val p = line.item.path
+                            val toggle = { selected = if (p in selected) selected - p else selected + p }
+                            if (grid) GridCell(line.item, p in selected, toggle) { preview = line.item }
+                            else FileRow(line.item, p in selected, toggle, { preview = line.item }) { Fx.open(ctx, line.item) }
+                        }
                     }
                 }
             }
@@ -415,22 +531,45 @@ fun MainScreen() {
     if (showMove) {
         FolderPicker(onDismiss = { showMove = false }, onPick = { showMove = false; doMove(it) })
     }
+
+    preview?.let { item ->
+        PreviewDialog(item, onClose = { preview = null }, onOpen = { Fx.open(ctx, item) })
+    }
 }
 
 @Composable
-fun FileRow(item: FileItem, selected: Boolean, onToggle: () -> Unit, onOpen: () -> Unit) {
+fun Thumb(item: FileItem, modifier: Modifier) {
+    val ctx = LocalContext.current
+    val c = colorOf(item.cat)
+    if (item.cat == Cat.FOTOS || item.cat == Cat.VIDEOS) {
+        val req = remember(item.path) { ImageRequest.Builder(ctx).data(File(item.path)).size(300).crossfade(true).build() }
+        Box(modifier.background(c.copy(alpha = .15f)), contentAlignment = Alignment.Center) {
+            AsyncImage(model = req, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            if (item.cat == Cat.VIDEOS) {
+                Box(Modifier.size(28.dp).clip(CircleShape).background(Color(0x99000000)), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(20.dp))
+                }
+            }
+        }
+    } else {
+        Box(modifier.background(c.copy(alpha = .2f)), contentAlignment = Alignment.Center) {
+            Icon(iconFor(item.cat), null, tint = c, modifier = Modifier.size(28.dp))
+        }
+    }
+}
+
+@Composable
+fun FileRow(item: FileItem, selected: Boolean, onToggle: () -> Unit, onPreview: () -> Unit, onOpen: () -> Unit) {
     val c = colorOf(item.cat)
     Card(
         onClick = onToggle,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
         colors = CardDefaults.cardColors(containerColor = if (selected) c.copy(alpha = .15f) else Color.White),
         border = if (selected) BorderStroke(2.dp, c) else null,
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
         Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(44.dp).clip(CircleShape).background(c.copy(alpha = .2f)), contentAlignment = Alignment.Center) {
-                Icon(iconFor(item.cat), null, tint = c)
-            }
+            Thumb(item, Modifier.size(60.dp).clip(RoundedCornerShape(10.dp)).clickable(onClick = onPreview))
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(item.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -445,6 +584,205 @@ fun FileRow(item: FileItem, selected: Boolean, onToggle: () -> Unit, onOpen: () 
             IconButton(onClick = onOpen) { Icon(Icons.Default.OpenInNew, "Abrir", tint = c) }
         }
     }
+}
+
+@Composable
+fun GridCell(item: FileItem, selected: Boolean, onToggle: () -> Unit, onPreview: () -> Unit) {
+    val c = colorOf(item.cat)
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        Modifier.padding(3.dp).aspectRatio(1f).clip(shape)
+            .then(if (selected) Modifier.border(3.dp, c, shape) else Modifier)
+            .clickable(onClick = onToggle)
+    ) {
+        Thumb(item, Modifier.fillMaxSize())
+        Text(
+            item.name, color = Color.White, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Color(0x99000000)).padding(horizontal = 4.dp, vertical = 2.dp)
+        )
+        Icon(
+            if (selected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked, null,
+            tint = if (selected) c else Color.White,
+            modifier = Modifier.align(Alignment.TopStart).padding(4.dp).size(22.dp)
+                .background(if (selected) Color.White else Color(0x55000000), CircleShape)
+        )
+        Box(
+            Modifier.align(Alignment.TopEnd).padding(4.dp).size(26.dp).clip(CircleShape)
+                .background(Color(0x99000000)).clickable(onClick = onPreview),
+            contentAlignment = Alignment.Center
+        ) { Icon(Icons.Default.Visibility, "Vista previa", tint = Color.White, modifier = Modifier.size(16.dp)) }
+    }
+}
+
+@Composable
+fun PreviewDialog(item: FileItem, onClose: () -> Unit, onOpen: () -> Unit) {
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize(), color = Color(0xFF111111)) {
+            Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+                Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                        Text(item.name, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            item.ext.uppercase() + " · " + Fx.fmtSize(item.size) + " · " + Fx.fmtDate(item.modified),
+                            color = Color(0xFFBBBBBB), fontSize = 12.sp
+                        )
+                    }
+                    TextButton(onClick = onOpen) { Text("Abrir") }
+                    IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Cerrar", tint = Color.White) }
+                }
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    when {
+                        item.cat == Cat.FOTOS -> AsyncImage(
+                            model = File(item.path), contentDescription = null,
+                            contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize()
+                        )
+                        item.cat == Cat.VIDEOS -> VideoPreview(item.path)
+                        item.cat == Cat.MUSICA -> AudioPreview(item)
+                        item.ext == "pdf" -> PdfPreview(item.path)
+                        item.ext == "txt" || item.ext == "csv" || item.ext == "md" -> TextPreview(item.path)
+                        else -> Text(
+                            "Sin vista previa para este formato.\nToca Abrir para verlo con otra app.",
+                            color = Color.White, textAlign = TextAlign.Center, modifier = Modifier.padding(24.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun VideoPreview(path: String) {
+    val holder = remember { arrayOfNulls<VideoView>(1) }
+    DisposableEffect(path) { onDispose { try { holder[0]?.stopPlayback() } catch (e: Exception) { } } }
+    AndroidView(
+        factory = { c ->
+            VideoView(c).apply {
+                val mc = MediaController(c)
+                mc.setAnchorView(this)
+                setMediaController(mc)
+                setVideoPath(path)
+                setOnPreparedListener { start() }
+                holder[0] = this
+            }
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+@Composable
+fun AudioPreview(item: FileItem) {
+    val mp = remember { MediaPlayer() }
+    var ready by remember { mutableStateOf(false) }
+    var playing by remember { mutableStateOf(false) }
+    var failed by remember { mutableStateOf(false) }
+    var pos by remember { mutableStateOf(0f) }
+    DisposableEffect(item.path) {
+        try {
+            mp.setDataSource(item.path)
+            mp.setOnPreparedListener { ready = true }
+            mp.setOnCompletionListener { playing = false; pos = 0f }
+            mp.setOnErrorListener { _, _, _ -> failed = true; true }
+            mp.prepareAsync()
+        } catch (e: Exception) {
+            failed = true
+        }
+        onDispose { try { mp.release() } catch (e: Exception) { } }
+    }
+    LaunchedEffect(playing) {
+        while (playing) {
+            try {
+                val d = mp.duration
+                if (d > 0) pos = mp.currentPosition.toFloat() / d
+            } catch (e: Exception) { }
+            delay(250)
+        }
+    }
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+        Icon(Icons.Default.MusicNote, null, tint = Color(0xFFFFA726), modifier = Modifier.size(96.dp))
+        Text(item.name, color = Color.White, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(16.dp))
+        if (failed) {
+            Text("No se pudo reproducir este audio aquí. Prueba con Abrir.", color = Color.White, textAlign = TextAlign.Center)
+        } else {
+            FilledIconButton(
+                onClick = {
+                    if (playing) { mp.pause(); playing = false } else { mp.start(); playing = true }
+                },
+                enabled = ready, modifier = Modifier.size(64.dp)
+            ) {
+                Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, null, modifier = Modifier.size(36.dp))
+            }
+            Spacer(Modifier.height(16.dp))
+            LinearProgressIndicator(progress = { pos }, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+fun PdfPreview(path: String) {
+    var page by remember { mutableStateOf(0) }
+    var count by remember { mutableStateOf(1) }
+    var bmp by remember { mutableStateOf<Bitmap?>(null) }
+    var failed by remember { mutableStateOf(false) }
+    LaunchedEffect(path, page) {
+        val r: Pair<Int, Bitmap>? = withContext(Dispatchers.IO) {
+            try {
+                val fd = ParcelFileDescriptor.open(File(path), ParcelFileDescriptor.MODE_READ_ONLY)
+                val rd = PdfRenderer(fd)
+                try {
+                    val n = rd.pageCount
+                    val p = rd.openPage(page.coerceIn(0, n - 1))
+                    val b = Bitmap.createBitmap(p.width * 2, p.height * 2, Bitmap.Config.ARGB_8888)
+                    b.eraseColor(android.graphics.Color.WHITE)
+                    p.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    p.close()
+                    n to b
+                } finally {
+                    rd.close()
+                    fd.close()
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }
+        if (r == null) failed = true else { count = r.first; bmp = r.second }
+    }
+    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val b = bmp
+            if (failed) Text("No se pudo mostrar este PDF. Prueba con Abrir.", color = Color.White)
+            else if (b != null) Image(b.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+            else CircularProgressIndicator()
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { if (page > 0) page-- }, enabled = page > 0) { Text("◀ Anterior") }
+            Text("Página ${page + 1} de $count", color = Color.White)
+            TextButton(onClick = { if (page < count - 1) page++ }, enabled = page < count - 1) { Text("Siguiente ▶") }
+        }
+    }
+}
+
+@Composable
+fun TextPreview(path: String) {
+    var text by remember { mutableStateOf("Cargando…") }
+    LaunchedEffect(path) {
+        text = withContext(Dispatchers.IO) {
+            try {
+                File(path).bufferedReader().use { r ->
+                    val buf = CharArray(6000)
+                    val n = r.read(buf)
+                    if (n > 0) String(buf, 0, n) else "(archivo vacío)"
+                }
+            } catch (e: Exception) {
+                "No se pudo leer el archivo"
+            }
+        }
+    }
+    Text(
+        text, color = Color.White, fontSize = 13.sp,
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)
+    )
 }
 
 @Composable

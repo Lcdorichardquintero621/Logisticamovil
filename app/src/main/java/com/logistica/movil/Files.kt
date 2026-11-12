@@ -16,7 +16,16 @@ import java.util.Date
 import java.util.Locale
 
 enum class Cat(val label: String) {
-    FOTOS("Fotos"), VIDEOS("Videos"), MUSICA("Música"), DOCS("Documentos"), OCULTOS("Ocultos")
+    FOTOS("Fotos"), VIDEOS("Videos"), MUSICA("Música"), DOCS("Documentos")
+}
+
+/** Una opción de búsqueda: un tipo de archivo, visible u oculto. */
+data class Opt(val cat: Cat, val hidden: Boolean)
+
+/** Grupos de la carpeta Media de WhatsApp. */
+enum class WaGroup(val label: String) {
+    VOZ("Notas de voz"), FOTOS("Fotos"), VIDEOS("Videos"), DOCS("Documentos"),
+    STICKERS("Stickers"), AUDIOS("Audios"), GIFS("GIFs")
 }
 
 data class FileItem(
@@ -26,7 +35,8 @@ data class FileItem(
     val modified: Long,
     val ext: String,
     val cat: Cat?,
-    val hidden: Boolean
+    val hidden: Boolean,
+    val group: String? = null
 ) {
     val parent: String get() = File(path).parent ?: ""
 }
@@ -48,11 +58,10 @@ object Fx {
         else -> null
     }
 
-    /** Busca archivos. Un archivo entra si su tipo está elegido, o si es oculto y "Ocultos" está elegido. */
-    suspend fun scan(root: File, wanted: Set<Cat>, onProgress: (Int) -> Unit): List<FileItem> =
+    /** Busca archivos. Un archivo entra si su tipo y su condición (visible/oculto) están elegidos. */
+    suspend fun scan(root: File, wanted: Set<Opt>, onProgress: (Int) -> Unit): List<FileItem> =
         withContext(Dispatchers.IO) {
             val out = ArrayList<FileItem>()
-            val wantHidden = Cat.OCULTOS in wanted
 
             fun walk(dir: File, hiddenCtx: Boolean, depth: Int) {
                 if (depth > 40) return
@@ -64,10 +73,9 @@ object Fx {
                         walk(f, hiddenCtx || f.name.startsWith("."), depth + 1)
                     } else {
                         val ext = f.extension.lowercase()
-                        val cat = catOf(ext)
+                        val cat = catOf(ext) ?: continue
                         val hidden = hiddenCtx || f.name.startsWith(".")
-                        val match = (cat != null && cat in wanted) || (wantHidden && hidden)
-                        if (match) {
+                        if (Opt(cat, hidden) in wanted) {
                             out.add(FileItem(f.path, f.name, f.length(), f.lastModified(), ext, cat, hidden))
                             if (out.size % 50 == 0) onProgress(out.size)
                         }
@@ -75,6 +83,60 @@ object Fx {
                 }
             }
             walk(root, false, 0)
+            out
+        }
+
+    private fun waGroupOf(folder: String): WaGroup? {
+        val n = folder.lowercase()
+        return when {
+            "voice" in n -> WaGroup.VOZ
+            "sticker" in n -> WaGroup.STICKERS
+            "animated" in n || "gif" in n -> WaGroup.GIFS
+            "audio" in n -> WaGroup.AUDIOS
+            "video" in n -> WaGroup.VIDEOS
+            "image" in n -> WaGroup.FOTOS
+            "document" in n -> WaGroup.DOCS
+            else -> null
+        }
+    }
+
+    /** Busca solo en la carpeta Media de WhatsApp (y WhatsApp Business), separada por grupos. */
+    suspend fun scanWhatsApp(root: File, wanted: Set<WaGroup>, onProgress: (Int) -> Unit): List<FileItem> =
+        withContext(Dispatchers.IO) {
+            val out = ArrayList<FileItem>()
+            val seen = HashSet<String>()
+            val bases = listOf(
+                "Android/media/com.whatsapp/WhatsApp/Media",
+                "WhatsApp/Media",
+                "Android/media/com.whatsapp.w4b/WhatsApp Business/Media",
+                "WhatsApp Business/Media"
+            )
+
+            fun walk(dir: File, g: WaGroup, depth: Int) {
+                if (depth > 10) return
+                ensureActive()
+                val list = dir.listFiles() ?: return
+                for (f in list) {
+                    if (f.isDirectory) {
+                        walk(f, g, depth + 1)
+                    } else if (f.name != ".nomedia") {
+                        val key = try { f.canonicalPath } catch (e: Exception) { f.path }
+                        if (!seen.add(key)) continue
+                        val ext = f.extension.lowercase()
+                        out.add(FileItem(f.path, f.name, f.length(), f.lastModified(), ext, catOf(ext), f.name.startsWith("."), g.label))
+                        if (out.size % 50 == 0) onProgress(out.size)
+                    }
+                }
+            }
+
+            for (b in bases) {
+                val dirs = File(root, b).listFiles() ?: continue
+                for (d in dirs) {
+                    if (!d.isDirectory) continue
+                    val g = waGroupOf(d.name) ?: continue
+                    if (g in wanted) walk(d, g, 0)
+                }
+            }
             out
         }
 
